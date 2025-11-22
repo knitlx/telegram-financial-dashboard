@@ -120,7 +120,7 @@ export default function Home() {
           setSelectedCurrency('all'); // If no data, default to 'all'
         }
       } catch (e: any) {
-        setError("DEBUG: Это моя тестовая ошибка! " + e.message); // FORCE A DEBUG MESSAGE
+        setError(e.message);
       } finally {
         setLoading(false);
       }
