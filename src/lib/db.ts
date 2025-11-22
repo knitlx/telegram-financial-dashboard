@@ -10,9 +10,11 @@ if (!process.env.DATABASE_URL) {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    // For Supabase, often you need to set rejectUnauthorized to false in development
-    // Be cautious with this in production; ensure you understand the implications
-    rejectUnauthorized: process.env.NODE_ENV === 'production' ? true : false,
+    // WARNING: Disabling rejectUnauthorized makes the connection less secure.
+    // This is often done for convenience in development or for prototypes
+    // when dealing with self-signed certs or environments where CA certs are hard to manage.
+    // For production, consider providing a trusted CA certificate.
+    rejectUnauthorized: false, 
   },
 });
 
