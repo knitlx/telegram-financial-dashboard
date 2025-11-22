@@ -97,9 +97,27 @@ export default function Home() {
         setTransactions(data);
         if (data.length > 0) {
           const currencies = [...new Set(data.map(tx => tx.currency))];
-          setSelectedCurrency(currencies.length > 1 ? 'all' : currencies[0]);
+          if (currencies.length === 1) {
+            setSelectedCurrency(currencies[0]); // Only one currency, select it
+          } else {
+            // Multiple currencies, find the most frequent one
+            const currencyCounts: { [key: string]: number } = {};
+            data.forEach(tx => {
+              currencyCounts[tx.currency] = (currencyCounts[tx.currency] || 0) + 1;
+            });
+
+            let mostFrequentCurrency = '';
+            let maxCount = 0;
+            for (const currency in currencyCounts) {
+              if (currencyCounts[currency] > maxCount) {
+                maxCount = currencyCounts[currency];
+                mostFrequentCurrency = currency;
+              }
+            }
+            setSelectedCurrency(mostFrequentCurrency || currencies[0]); // Fallback to first if somehow no frequent
+          }
         } else {
-          setSelectedCurrency('all');
+          setSelectedCurrency('all'); // If no data, default to 'all'
         }
       } catch (e: any) {
         setError("DEBUG: Это моя тестовая ошибка! " + e.message); // FORCE A DEBUG MESSAGE
