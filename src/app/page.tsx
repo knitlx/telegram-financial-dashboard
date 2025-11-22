@@ -102,7 +102,7 @@ export default function Home() {
           setSelectedCurrency('all');
         }
       } catch (e: any) {
-        setError(e.message);
+        setError("DEBUG: Это моя тестовая ошибка! " + e.message); // FORCE A DEBUG MESSAGE
       } finally {
         setLoading(false);
       }
