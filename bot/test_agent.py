@@ -127,8 +127,22 @@ async def db_fetch_last(
 
 
 async def cleanup():
+    await execute(
+        """
+        CREATE TABLE IF NOT EXISTS public.balance_snapshots (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id bigint NOT NULL,
+            currency text NOT NULL,
+            balance_amount numeric(18,4) NOT NULL,
+            note text,
+            snapshot_at timestamp with time zone NOT NULL DEFAULT now(),
+            created_at timestamp with time zone NOT NULL DEFAULT now()
+        )
+        """
+    )
     await execute("DELETE FROM public.transactions WHERE user_id=$1", TEST_USER_ID)
     await execute("DELETE FROM public.fx_exchanges WHERE user_id=$1", TEST_USER_ID)
+    await execute("DELETE FROM public.balance_snapshots WHERE user_id=$1", TEST_USER_ID)
     await execute("DELETE FROM public.user_categories WHERE user_id=$1 AND is_default=false", TEST_USER_ID)
     await execute("DELETE FROM public.user_settings WHERE user_id=$1", TEST_USER_ID)
     print(f"🧹 Тестовые данные удалены (user_id={TEST_USER_ID})")
@@ -504,6 +518,41 @@ async def test_tools_fx_and_exchanges():
         r.fail("tools.get_exchange_stats", f"got={stats}")
 
 
+async def test_tools_balance_snapshots():
+    print("\n📋 Tools: snapshots и текущие балансы")
+    snap = await tool_call_json(
+        "set_balance_snapshot",
+        {"currency": "THB", "balance_amount": 5000, "note": "initial sync"},
+    )
+    if isinstance(snap, dict) and str(snap.get("currency", "")).upper() == "THB":
+        r.ok("tools.set_balance_snapshot", "THB=5000")
+    else:
+        r.fail("tools.set_balance_snapshot", f"got={snap}")
+        return
+
+    await tool_call_json(
+        "add_transaction",
+        {"category": "Прочее", "title": "snapshot test", "amount": 250, "currency": "THB", "kind": "expense"},
+    )
+
+    balances = await tool_call_json("get_currency_balances", {})
+    if not isinstance(balances, list):
+        r.fail("tools.get_currency_balances", f"got={balances}")
+        return
+
+    thb = next((row for row in balances if isinstance(row, dict) and row.get("currency") == "THB"), None)
+    if thb is None:
+        r.fail("tools.get_currency_balances", "THB row not found")
+        return
+
+    current = float(thb.get("current_balance", 0))
+    # 5000 snapshot - 250 expense = 4750
+    if abs(current - 4750.0) < 0.001:
+        r.ok("tools.get_currency_balances", f"THB={current:.2f}")
+    else:
+        r.fail("tools.get_currency_balances", f"expected 4750 got={current}")
+
+
 def build_test_list(mode: str) -> list:
     # regression: только проблемный агентный тест + полный tool-level набор (быстрый и без лишних токенов)
     base = [
@@ -513,6 +562,7 @@ def build_test_list(mode: str) -> list:
         test_tools_categories_management,
         test_tools_settings,
         test_tools_fx_and_exchanges,
+        test_tools_balance_snapshots,
     ]
     if mode == "regression":
         return base
@@ -541,6 +591,10 @@ async def main():
         choices=["regression", "full"],
         default=os.environ.get("TEST_MODE", "regression"),
     )
+    parser.add_argument(
+        "--only",
+        help="Имя теста или список через запятую, например: test_update_transaction,test_tools_balance_snapshots",
+    )
     args = parser.parse_args()
 
     os.environ["TEST_LOG"] = "1"
@@ -564,6 +618,12 @@ async def main():
     print()
 
     tests = build_test_list(args.mode)
+    if args.only:
+        wanted = {name.strip() for name in args.only.split(",") if name.strip()}
+        tests = [t for t in tests if t.__name__ in wanted]
+        if not tests:
+            print(f"❌ Не найдено тестов по --only={args.only}")
+            sys.exit(2)
     print(f"🧪 Режим тестирования: {args.mode} ({len(tests)} тестов)")
 
     for t in tests:

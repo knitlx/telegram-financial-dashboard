@@ -67,6 +67,16 @@ interface RatesApiResponse {
   error?: string;
 }
 
+interface CurrencyBalance {
+  currency: string;
+  current_balance: number | string;
+}
+
+interface BalancesApiResponse {
+  balances?: CurrencyBalance[];
+  error?: string;
+}
+
 const ITEMS_PER_PAGE = 10;
 
 function localDate(d: Date): string {
@@ -131,6 +141,7 @@ function DateInput({ label, value, onChange }: { label: string; value: string; o
 export default function Home() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [exchanges, setExchanges] = useState<FxExchange[]>([]);
+  const [currencyBalances, setCurrencyBalances] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reportCurrency, setReportCurrency] = useState<string>('all');
@@ -162,24 +173,32 @@ export default function Home() {
         }
 
         const headers: Record<string, string> = initData ? { Authorization: `Tma ${initData}` } : {};
-        const [txResp, fxResp] = await Promise.all([
+        const [txResp, fxResp, balancesResp] = await Promise.all([
           fetch('/api/transactions', { headers }),
           fetch('/api/fx-exchanges', { headers }),
+          fetch('/api/balances', { headers }),
         ]);
 
         const txData = (await txResp.json()) as TransactionsApiResponse;
         const fxData = (await fxResp.json()) as unknown;
+        const balancesData = (await balancesResp.json()) as BalancesApiResponse;
 
         if (txData.error) throw new Error(txData.error);
+        if (balancesData.error) throw new Error(balancesData.error);
 
         const txPayload = txData.transactions ?? [];
         const txList = Array.isArray(txPayload) ? txPayload : [];
         const fxList = Array.isArray(fxData) ? (fxData as FxExchange[]) : [];
+        const balancesList = Array.isArray(balancesData.balances) ? balancesData.balances : [];
+        const balancesMap = Object.fromEntries(
+          balancesList.map((row) => [row.currency, toNumber(row.current_balance)]),
+        ) as Record<string, number>;
 
         if (!cancelled) {
           setTransactions(txList);
           setExchanges(fxList);
-          const currencies = [...new Set(txList.map((tx) => tx.currency))];
+          setCurrencyBalances(balancesMap);
+          const currencies = [...new Set([...txList.map((tx) => tx.currency), ...Object.keys(balancesMap)])];
           setReportCurrency(currencies.length === 1 ? currencies[0] : 'all');
         }
       } catch (e: unknown) {
@@ -195,7 +214,10 @@ export default function Home() {
     };
   }, []);
 
-  const availableCurrencies = useMemo(() => [...new Set(transactions.map((tx) => tx.currency))], [transactions]);
+  const availableCurrencies = useMemo(
+    () => [...new Set([...transactions.map((tx) => tx.currency), ...Object.keys(currencyBalances)])],
+    [transactions, currencyBalances],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -294,6 +316,26 @@ export default function Home() {
   );
 
   const dashboardCurrency = reportCurrency === 'all' ? selectedDisplayCurrency ?? '' : reportCurrency;
+  const snapshotBalance = useMemo(() => {
+    if (reportCurrency === 'all') {
+      if (!selectedDisplayCurrency) return null;
+      let total = 0;
+      for (const [currency, value] of Object.entries(currencyBalances)) {
+        if (currency === selectedDisplayCurrency) {
+          total += value;
+          continue;
+        }
+        const rate = displayRates[currency];
+        if (rate) total += value / rate;
+      }
+      return total;
+    }
+    if (currencyBalances[reportCurrency] !== undefined) {
+      return currencyBalances[reportCurrency];
+    }
+    return null;
+  }, [reportCurrency, selectedDisplayCurrency, currencyBalances, displayRates]);
+  const balanceValue = snapshotBalance ?? balance;
 
   const now = new Date();
   const d30 = localDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30));
@@ -384,7 +426,7 @@ export default function Home() {
         </div>
 
         <div className="px-4 space-y-4">
-          {statsTx.length > 0 ? (
+          {(statsTx.length > 0 || snapshotBalance !== null) ? (
             <>
               <div className="bg-slate-900 rounded-3xl p-5 text-white">
                 <div className="grid grid-cols-3 gap-2">
@@ -400,8 +442,8 @@ export default function Home() {
                   </div>
                   <div className="text-center">
                     <div className="text-[10px] font-medium text-slate-400 uppercase tracking-wider mb-1.5">Итог</div>
-                    <div className={`text-xl font-bold ${balance >= 0 ? 'text-teal-400' : 'text-rose-400'}`}>
-                      {balance >= 0 ? '+' : ''}{balance.toFixed(0)}
+                    <div className={`text-xl font-bold ${balanceValue >= 0 ? 'text-teal-400' : 'text-rose-400'}`}>
+                      {balanceValue >= 0 ? '+' : ''}{balanceValue.toFixed(0)}
                     </div>
                     <div className="text-[10px] text-slate-500 mt-0.5">{dashboardCurrency}</div>
                   </div>
@@ -418,20 +460,24 @@ export default function Home() {
                 </div>
               )}
 
-              <div className="bg-white rounded-2xl p-4">
-                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Расходы по категориям</div>
-                <ExpensePieChart
-                  data={expenseCategoriesData}
-                  currency={dashboardCurrency}
-                  totalExpenses={totalExpenses}
-                  transactions={statsTx}
-                />
-              </div>
+              {statsTx.length > 0 && (
+                <>
+                  <div className="bg-white rounded-2xl p-4">
+                    <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Расходы по категориям</div>
+                    <ExpensePieChart
+                      data={expenseCategoriesData}
+                      currency={dashboardCurrency}
+                      totalExpenses={totalExpenses}
+                      transactions={statsTx}
+                    />
+                  </div>
 
-              <div className="bg-white rounded-2xl p-4">
-                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Динамика</div>
-                <MonthlyBarChart transactions={statsTx} currency={dashboardCurrency} />
-              </div>
+                  <div className="bg-white rounded-2xl p-4">
+                    <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Динамика</div>
+                    <MonthlyBarChart transactions={statsTx} currency={dashboardCurrency} />
+                  </div>
+                </>
+              )}
             </>
           ) : (
             <div className="bg-white rounded-2xl p-4 text-center text-slate-400 text-sm">

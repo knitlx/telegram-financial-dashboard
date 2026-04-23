@@ -46,9 +46,17 @@ export async function GET(req: NextRequest) {
       if (baseIsCrypto) {
         const baseUsd = data[CRYPTO_IDS[base]]?.usd;
         if (baseUsd) {
-          fiatTargets.forEach(s => {
-            if (rates[s]) rates[s] = rates[s] / baseUsd;
-          });
+          // For crypto base (e.g. USDT), we still need fiat-per-base rates.
+          // Example: THB per USDT = (THB per USD) * (USD per USDT).
+          if (fiatTargets.length > 0) {
+            const usdResp = await fetch('https://open.er-api.com/v6/latest/USD', { next: { revalidate: 3600 } });
+            const usdData = await usdResp.json();
+            fiatTargets.forEach(s => {
+              const perUsd = usdData.rates?.[s];
+              if (perUsd) rates[s] = perUsd * baseUsd;
+            });
+          }
+
           cryptoTargets.forEach(s => {
             const targetUsd = data[CRYPTO_IDS[s]]?.usd;
             if (targetUsd && baseUsd) rates[s] = targetUsd / baseUsd;

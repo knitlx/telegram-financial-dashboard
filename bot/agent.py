@@ -7,6 +7,7 @@ from tools.categories import add_category, deactivate_category, rename_category
 from tools.settings import set_user_settings
 from tools.fx import fx_convert
 from tools.transfers import record_exchange, get_exchange_stats, get_exchanges
+from tools.balances import set_balance_snapshot, get_balance_snapshots, get_currency_balances
 
 _client: Optional[AsyncOpenAI] = None
 
@@ -231,6 +232,50 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_balance_snapshot",
+            "description": "Установить текущий баланс по конкретной валюте (точка сверки/калибровка).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "currency": {"type": "string", "description": "ISO-код валюты, например THB, RUB, USD"},
+                    "balance_amount": {"type": "number", "description": "Текущий реальный остаток по валюте"},
+                    "iso_datetime": {"type": "string", "description": "Время точки сверки в ISO 8601 UTC, если указано"},
+                    "note": {"type": "string", "description": "Комментарий к сверке"},
+                },
+                "required": ["currency", "balance_amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_balance_snapshots",
+            "description": "История точек сверки баланса по валютам.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "currency": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Максимум записей, по умолчанию 20"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_currency_balances",
+            "description": "Текущие балансы по валютам с учётом точки сверки, операций и обменов после неё.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -259,6 +304,10 @@ def _build_system_prompt(user_timezone: str, default_currency: Optional[str], us
 ПРАВИЛА ОБМЕНА ВАЛЮТЫ:
 - Если пользователь говорит "поменял X на Y" — это record_exchange, НЕ add_transaction
 - После record_exchange сообщи: сколько получил, курс обмена, рыночный курс, разница в %
+
+ПРАВИЛА СВЕРКИ БАЛАНСА:
+- Если пользователь хочет "обнулить/сверить/зафиксировать текущий баланс" по валюте — вызови set_balance_snapshot
+- Если просит "покажи текущие балансы по валютам" — вызови get_currency_balances
 
 ОБЯЗАТЕЛЬНО ВЫЗЫВАЙ ИНСТРУМЕНТ:
 - Если запрос явно требует действия в БД — вызови нужный tool
@@ -292,6 +341,12 @@ async def _dispatch_tool(name: str, args: dict, user_id: int) -> str:
         return await get_exchange_stats(user_id=user_id, **args)
     if name == "get_exchanges":
         return await get_exchanges(user_id=user_id, **args)
+    if name == "set_balance_snapshot":
+        return await set_balance_snapshot(user_id=user_id, **args)
+    if name == "get_balance_snapshots":
+        return await get_balance_snapshots(user_id=user_id, **args)
+    if name == "get_currency_balances":
+        return await get_currency_balances(user_id=user_id)
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
