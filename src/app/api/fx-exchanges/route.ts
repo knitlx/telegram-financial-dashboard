@@ -18,13 +18,12 @@ export async function GET(req: NextRequest) {
 
     if (authorization?.startsWith('Tma ')) {
       if (!token) {
-        return NextResponse.json({ error: 'Internal Server Error: Bot token not configured' }, { status: 500 });
+        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
       }
       const user = validateInitData(authorization.substring(4), token);
       userId = user.id;
     } else if (allowDevBypass) {
-      const devUserIdRaw = process.env.DEV_USER_ID;
-      const devUserId = Number(devUserIdRaw);
+      const devUserId = Number(process.env.DEV_USER_ID);
       if (!Number.isInteger(devUserId) || devUserId <= 0) {
         return NextResponse.json(
           { error: 'Set DEV_USER_ID to use ALLOW_DEV_AUTH_BYPASS in development' },
@@ -33,29 +32,21 @@ export async function GET(req: NextRequest) {
       }
       userId = devUserId;
     } else {
-      return NextResponse.json({ error: 'Unauthorized: Missing Authorization Header' }, { status: 401 });
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const rows = await query(
-      'SELECT id, user_id, category, title, amount, currency, timestamp, day, kind, created_at, updated_at FROM public.transactions WHERE user_id = $1 ORDER BY timestamp DESC',
+      `SELECT id, from_currency, from_amount, to_currency, to_amount, actual_rate, market_rate, rate_diff_pct, loss_in_from, note, exchanged_at FROM public.fx_exchanges WHERE user_id = $1 ORDER BY exchanged_at DESC`,
       [userId],
     );
 
-    const settings = await query<{ default_currency: string }>(
-      'SELECT default_currency FROM public.user_settings WHERE user_id = $1',
-      [userId],
-    );
-    const defaultCurrency = settings[0]?.default_currency ?? null;
-
-    return NextResponse.json({ transactions: rows, defaultCurrency });
-
+    return NextResponse.json(rows);
   } catch (error: unknown) {
     const message = errorMessage(error);
     if (message.includes('Invalid initData')) {
       return NextResponse.json({ error: `Unauthorized: ${message}` }, { status: 401 });
     }
-
-    console.error('API Error:', error);
-    return NextResponse.json({ error: 'Failed to fetch transactions' }, { status: 500 });
+    console.error('FX API Error:', error);
+    return NextResponse.json({ error: 'Failed to fetch exchanges' }, { status: 500 });
   }
 }

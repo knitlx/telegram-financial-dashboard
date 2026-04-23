@@ -1,31 +1,29 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 
-// Dynamically import chart components with SSR disabled
 const ExpensePieChart = dynamic(() => import('@/components/ExpensePieChart'), { ssr: false });
 const MonthlyBarChart = dynamic(() => import('@/components/MonthlyBarChart'), { ssr: false });
 
+type TxKind = 'income' | 'expense' | 'transfer';
+type TypeFilter = 'all' | TxKind;
+type SortKey = 'timestamp-desc' | 'timestamp-asc' | 'amount-desc' | 'amount-asc';
 
-// --- Helper Components & Icons ---
-const IncomeIcon = () => (
-  <svg className="w-6 h-6 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v12m6-6H6" />
-  </svg>
-);
+interface TelegramWebApp {
+  initData?: string;
+  ready?: () => void;
+  expand?: () => void;
+  HapticFeedback?: { impactOccurred: (style: 'light' | 'medium' | 'heavy') => void };
+}
 
-const ExpenseIcon = () => (
-  <svg className="w-6 h-6 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 12H6" />
-  </svg>
-);
+interface TelegramWindow {
+  WebApp?: TelegramWebApp;
+}
 
-
-// Declare the Telegram WebApp type on the window object
 declare global {
   interface Window {
-    Telegram: any;
+    Telegram?: TelegramWindow;
   }
 }
 
@@ -34,313 +32,538 @@ interface Transaction {
   user_id: string;
   category: string;
   title: string;
-  amount: number;
+  amount: number | string;
   currency: string;
-  timestamp: string; // ISO date string
-  day: string;       // YYYY-MM-DD
-  kind: 'income' | 'expense';
+  timestamp: string;
+  day: string;
+  kind: TxKind;
   created_at: string;
   updated_at: string;
 }
 
+interface FxExchange {
+  id: string;
+  from_currency: string;
+  from_amount: number | string;
+  to_currency: string;
+  to_amount: number | string;
+  actual_rate: number | string;
+  market_rate: number | string | null;
+  rate_diff_pct: number | string | null;
+  loss_in_from: number | string | null;
+  note: string | null;
+  exchanged_at: string;
+}
+
+interface TransactionsApiResponse {
+  transactions?: Transaction[];
+  defaultCurrency?: string | null;
+  error?: string;
+}
+
+interface RatesApiResponse {
+  base?: string;
+  rates?: Record<string, number>;
+  error?: string;
+}
+
 const ITEMS_PER_PAGE = 10;
+
+function localDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+const TODAY = localDate(new Date());
+
+const kindConfig: Record<TxKind, { label: string; color: string; bg: string; sign: string }> = {
+  income: { label: 'Доход', color: 'text-teal-600', bg: 'bg-teal-50', sign: '+' },
+  expense: { label: 'Расход', color: 'text-rose-500', bg: 'bg-rose-50', sign: '−' },
+  transfer: { label: 'Перевод', color: 'text-slate-500', bg: 'bg-slate-100', sign: '⇄' },
+};
+
+function toNumber(value: number | string | null | undefined): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (!value) return 0;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function haptic(): void {
+  try {
+    window.Telegram?.WebApp?.HapticFeedback?.impactOccurred('light');
+  } catch {
+    // no-op
+  }
+}
+
+function PillButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={() => {
+        haptic();
+        onClick();
+      }}
+      className={`px-3 py-1.5 rounded-full text-sm font-medium transition-all duration-150 cursor-pointer select-none ${active ? 'bg-slate-800 text-white shadow-sm' : 'bg-slate-100 text-slate-500 hover:bg-slate-200 active:bg-slate-300'}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function DateInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-xs text-slate-400">{label}</span>
+      <input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="text-xs bg-white border border-slate-200 rounded-xl px-2 py-1.5 text-slate-700 focus:outline-none focus:border-indigo-400"
+      />
+    </div>
+  );
+}
 
 export default function Home() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [exchanges, setExchanges] = useState<FxExchange[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  
-  // --- Filter & Sort State ---
-  const [selectedCurrency, setSelectedCurrency] = useState<string | null>(null);
-  const [timeRange, setTimeRange] = useState('month'); // 'month', 'quarter', 'year', 'all'
-  const [typeFilter, setTypeFilter] = useState('all'); // 'all', 'income', 'expense'
-  const [sortConfig, setSortConfig] = useState({ key: 'timestamp', direction: 'desc' });
+  const [reportCurrency, setReportCurrency] = useState<string>('all');
+  const [selectedDisplayCurrency, setSelectedDisplayCurrency] = useState<string | null>(null);
+  const [displayRates, setDisplayRates] = useState<Record<string, number>>({});
+  const [dateFrom, setDateFrom] = useState(() => {
+    const n = new Date();
+    return localDate(new Date(n.getFullYear(), n.getMonth(), n.getDate() - 30));
+  });
+  const [dateTo, setDateTo] = useState(TODAY);
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  const [sortKey, setSortKey] = useState<SortKey>('timestamp-desc');
   const [currentPage, setCurrentPage] = useState(1);
 
-
-  // --- Haptic Feedback Handler ---
-  const handleFilterClick = (setter: Function, value: any) => {
-    try {
-      if (window.Telegram?.WebApp?.HapticFeedback?.impactOccurred) {
-        window.Telegram.WebApp.HapticFeedback.impactOccurred('light');
-      }
-    } catch (e) {
-      // Haptic feedback is not critical, so we can ignore errors
-    }
-    setter(value);
-  };
-
+  const resetPage = (): void => setCurrentPage(1);
 
   useEffect(() => {
-    // Basic Telegram Mini App setup
-    if (typeof window.Telegram !== 'undefined' && window.Telegram.WebApp) {
-      const tg = window.Telegram.WebApp;
-      tg.ready();
-    }
+    let cancelled = false;
 
-    const initData = typeof window.Telegram !== 'undefined' ? window.Telegram.WebApp.initData : null;
-
-    if (!initData) {
-      setError("Это приложение предназначено для работы внутри Telegram.");
-      setLoading(false);
-      return;
-    }
-
-    async function fetchTransactions() {
+    const load = async (): Promise<void> => {
       try {
-        const response = await fetch('/api/transactions', { headers: { 'Authorization': `Tma ${initData}` } });
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-        }
-        const data: Transaction[] = await response.json();
-        setTransactions(data);
-        if (data.length > 0) {
-          const currencies = [...new Set(data.map(tx => tx.currency))];
-          if (currencies.length === 1) {
-            setSelectedCurrency(currencies[0]); // Only one currency, select it
-          } else {
-            // Multiple currencies, find the most frequent one
-            const currencyCounts: { [key: string]: number } = {};
-            data.forEach(tx => {
-              currencyCounts[tx.currency] = (currencyCounts[tx.currency] || 0) + 1;
-            });
+        window.Telegram?.WebApp?.ready?.();
+        window.Telegram?.WebApp?.expand?.();
 
-            let mostFrequentCurrency = '';
-            let maxCount = 0;
-            for (const currency in currencyCounts) {
-              if (currencyCounts[currency] > maxCount) {
-                maxCount = currencyCounts[currency];
-                mostFrequentCurrency = currency;
-              }
-            }
-            setSelectedCurrency(mostFrequentCurrency || currencies[0]); // Fallback to first if somehow no frequent
-          }
-        } else {
-          setSelectedCurrency('all'); // If no data, default to 'all'
+        const initData = window.Telegram?.WebApp?.initData ?? null;
+        const isDev = process.env.NODE_ENV === 'development';
+        if (!initData && !isDev) {
+          throw new Error('Открой в Telegram');
         }
-      } catch (e: any) {
-        setError(e.message);
+
+        const headers: Record<string, string> = initData ? { Authorization: `Tma ${initData}` } : {};
+        const [txResp, fxResp] = await Promise.all([
+          fetch('/api/transactions', { headers }),
+          fetch('/api/fx-exchanges', { headers }),
+        ]);
+
+        const txData = (await txResp.json()) as TransactionsApiResponse;
+        const fxData = (await fxResp.json()) as unknown;
+
+        if (txData.error) throw new Error(txData.error);
+
+        const txPayload = txData.transactions ?? [];
+        const txList = Array.isArray(txPayload) ? txPayload : [];
+        const fxList = Array.isArray(fxData) ? (fxData as FxExchange[]) : [];
+
+        if (!cancelled) {
+          setTransactions(txList);
+          setExchanges(fxList);
+          const currencies = [...new Set(txList.map((tx) => tx.currency))];
+          setReportCurrency(currencies.length === 1 ? currencies[0] : 'all');
+        }
+      } catch (e: unknown) {
+        if (!cancelled) setError(errorMessage(e));
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
-    }
+    };
 
-    fetchTransactions();
+    void load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // --- Data Processing Pipeline ---
+  const availableCurrencies = useMemo(() => [...new Set(transactions.map((tx) => tx.currency))], [transactions]);
 
-  // 1. Base filter for the transaction list (time, then currency if not 'all')
-  const baseFilteredTransactions = useMemo(() => {
-    const now = new Date();
-    let startDate = new Date();
-    let timeFiltered = transactions;
-
-    if (timeRange !== 'all') {
-      switch (timeRange) {
-        case 'month': startDate = new Date(now.getFullYear(), now.getMonth(), 1); break;
-        case 'quarter':
-          const quarter = Math.floor(now.getMonth() / 3);
-          startDate = new Date(now.getFullYear(), quarter * 3, 1);
-          break;
-        case 'year': startDate = new Date(now.getFullYear(), 0, 1); break;
-      }
-      timeFiltered = transactions.filter(tx => new Date(tx.timestamp) >= startDate);
-    }
-    
-    if (selectedCurrency === 'all') {
-      return timeFiltered;
-    }
-    return timeFiltered.filter(tx => tx.currency === selectedCurrency);
-  }, [transactions, selectedCurrency, timeRange]);
-  
-  // 2. Data source for stats and charts (requires a single currency)
-  const statsAndChartsData = useMemo(() => {
-    if (selectedCurrency === 'all') return [];
-    return baseFilteredTransactions;
-  }, [baseFilteredTransactions, selectedCurrency]);
-
-  // 3. Further filter and sort the list for display
-  const processedTransactions = useMemo(() => {
-    let list = [...baseFilteredTransactions];
-
-    if (typeFilter !== 'all') {
-      list = list.filter(tx => tx.kind === typeFilter);
-    }
-
-    list.sort((a, b) => {
-      let valA = a[sortConfig.key as keyof Transaction];
-      let valB = b[sortConfig.key as keyof Transaction];
-
-      if (sortConfig.key === 'amount') {
-        valA = parseFloat(valA as any);
-        valB = parseFloat(valB as any);
+  useEffect(() => {
+    let cancelled = false;
+    const loadDisplayRates = async (): Promise<void> => {
+      if (!selectedDisplayCurrency) return;
+      const unique = availableCurrencies.filter((s) => s !== selectedDisplayCurrency);
+      if (unique.length === 0) {
+        if (!cancelled) setDisplayRates({ [selectedDisplayCurrency]: 1 });
+        return;
       }
 
-      if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
-      if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
-      return 0;
+      try {
+        const resp = await fetch(`/api/rates?base=${selectedDisplayCurrency}&symbols=${unique.join(',')}`);
+        const data = (await resp.json()) as RatesApiResponse;
+        if (!cancelled && data.rates) setDisplayRates(data.rates);
+      } catch {
+        if (!cancelled) setDisplayRates({});
+      }
+    };
+
+    void loadDisplayRates();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDisplayCurrency, availableCurrencies]);
+
+  const filteredTx = useMemo(() => {
+    const from = dateFrom ? new Date(dateFrom) : null;
+    const to = dateTo ? new Date(`${dateTo}T23:59:59`) : null;
+    return transactions.filter((tx) => {
+      const d = new Date(tx.timestamp);
+      if (from && d < from) return false;
+      if (to && d > to) return false;
+      return true;
     });
-    
-    return list;
-  }, [baseFilteredTransactions, typeFilter, sortConfig]);
+  }, [transactions, dateFrom, dateTo]);
 
-  // 4. Paginate the final list
-  const paginatedTransactions = useMemo(() => {
-    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
-    return processedTransactions.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-  }, [processedTransactions, currentPage]);
-
-  const totalPages = Math.ceil(processedTransactions.length / ITEMS_PER_PAGE);
-
-  useEffect(() => { setCurrentPage(1); }, [selectedCurrency, timeRange, typeFilter, sortConfig]);
-
-
-  // --- Stat & Chart Calculations (use statsAndChartsData) ---
-
-  const availableCurrencies = useMemo(() => [...new Set(transactions.map(tx => tx.currency))], [transactions]);
+  const statsTx = useMemo(() => {
+    if (reportCurrency === 'all') {
+      if (!selectedDisplayCurrency) return [] as Transaction[];
+      return filteredTx
+        .filter((tx) => tx.kind !== 'transfer')
+        .flatMap((tx) => {
+          if (tx.currency === selectedDisplayCurrency) return [tx];
+          const rate = displayRates[tx.currency];
+          if (!rate) return [];
+          return [{ ...tx, amount: toNumber(tx.amount) / rate, currency: selectedDisplayCurrency }];
+        });
+    }
+    return filteredTx.filter((tx) => tx.currency === reportCurrency && tx.kind !== 'transfer');
+  }, [filteredTx, reportCurrency, selectedDisplayCurrency, displayRates]);
 
   const { totalIncome, totalExpenses, balance } = useMemo(() => {
-    let income = 0, expenses = 0;
-    statsAndChartsData.forEach(tx => {
-      const amount = parseFloat(tx.amount as any);
-      if (isNaN(amount)) return;
+    let income = 0;
+    let expenses = 0;
+    statsTx.forEach((tx) => {
+      const amount = toNumber(tx.amount);
       if (tx.kind === 'income') income += amount;
       else if (tx.kind === 'expense') expenses += amount;
     });
     return { totalIncome: income, totalExpenses: expenses, balance: income - expenses };
-  }, [statsAndChartsData]);
+  }, [statsTx]);
 
   const expenseCategoriesData = useMemo(() => {
-    const categories: { [key: string]: number } = {};
-    statsAndChartsData.forEach(tx => {
-      const amount = parseFloat(tx.amount as any);
-      if (isNaN(amount) || tx.kind !== 'expense') return;
-      categories[tx.category] = (categories[tx.category] || 0) + amount;
+    const cats: Record<string, number> = {};
+    statsTx.forEach((tx) => {
+      const amount = toNumber(tx.amount);
+      if (tx.kind !== 'expense' || amount <= 0) return;
+      cats[tx.category] = (cats[tx.category] || 0) + amount;
     });
-    return Object.entries(categories).map(([name, value]) => ({ name, value }));
-  }, [statsAndChartsData]);
+    return Object.entries(cats).map(([name, value]) => ({ name, value }));
+  }, [statsTx]);
 
-  const monthlySummaryData = useMemo(() => {
-    const months: { [key: string]: { income: number; expenses: number } } = {};
-    statsAndChartsData.forEach(tx => {
-      const amount = parseFloat(tx.amount as any);
-      if (isNaN(amount)) return;
-      const txDate = new Date(tx.timestamp);
-      const monthYear = `${txDate.getFullYear()}-${(txDate.getMonth() + 1).toString().padStart(2, '0')}`;
-      if (!months[monthYear]) months[monthYear] = { income: 0, expenses: 0 };
-      if (tx.kind === 'income') months[monthYear].income += amount;
-      else if (tx.kind === 'expense') months[monthYear].expenses += amount;
+  const processedTx = useMemo(() => {
+    const list = typeFilter === 'all' ? [...filteredTx] : filteredTx.filter((tx) => tx.kind === typeFilter);
+    const [key, dir] = sortKey.split('-') as ['timestamp' | 'amount', 'asc' | 'desc'];
+
+    list.sort((a, b) => {
+      const va = key === 'amount' ? toNumber(a.amount) : new Date(a.timestamp).getTime();
+      const vb = key === 'amount' ? toNumber(b.amount) : new Date(b.timestamp).getTime();
+      if (va < vb) return dir === 'asc' ? -1 : 1;
+      if (va > vb) return dir === 'asc' ? 1 : -1;
+      return 0;
     });
-    return Object.entries(months).sort(([a], [b]) => a.localeCompare(b)).map(([monthYear, data]) => ({ name: monthYear, ...data }));
-  }, [statsAndChartsData]);
 
+    return list;
+  }, [filteredTx, typeFilter, sortKey]);
 
-  // --- Render Logic ---
+  const totalPages = Math.ceil(processedTx.length / ITEMS_PER_PAGE);
+  const safePage = Math.min(Math.max(currentPage, 1), Math.max(totalPages, 1));
+  const paginatedTx = processedTx.slice((safePage - 1) * ITEMS_PER_PAGE, safePage * ITEMS_PER_PAGE);
 
-  if (loading) return <div className="p-8 text-center text-gray-500">Загрузка данных...</div>;
-  if (error) return <div className="p-8 text-center text-red-500">Ошибка: {error}</div>;
-
-  const FilterButton = ({ filterValue, label }: { filterValue: string, label: string }) => (
-    <button onClick={() => handleFilterClick(setTypeFilter, filterValue)} className={`px-3 py-1.5 rounded-full text-sm font-semibold transition-colors duration-200 ${typeFilter === filterValue ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>
-      {label}
-    </button>
+  const fxLoss = useMemo(
+    () => exchanges.reduce((sum, ex) => sum + toNumber(ex.loss_in_from), 0),
+    [exchanges],
   );
 
-  return (
-    <main className="min-h-screen bg-slate-50 p-4 font-sans">
-      <div className="w-full max-w-3xl mx-auto space-y-6">
-        <h1 className="text-3xl font-bold text-center text-slate-800">Финансовая сводка</h1>
+  const dashboardCurrency = reportCurrency === 'all' ? selectedDisplayCurrency ?? '' : reportCurrency;
 
-        {/* Filters Card */}
-        <div className="bg-white p-4 rounded-xl shadow-sm space-y-4">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-500 mb-2 px-2">Период</h3>
-            <div className="flex justify-center gap-2 flex-wrap">
-              <button onClick={() => handleFilterClick(setTimeRange, 'month')} className={`px-3 py-1.5 rounded-full text-sm font-semibold transition-colors duration-200 ${timeRange === 'month' ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>Месяц</button>
-              <button onClick={() => handleFilterClick(setTimeRange, 'quarter')} className={`px-3 py-1.5 rounded-full text-sm font-semibold transition-colors duration-200 ${timeRange === 'quarter' ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>Квартал</button>
-              <button onClick={() => handleFilterClick(setTimeRange, 'year')} className={`px-3 py-1.5 rounded-full text-sm font-semibold transition-colors duration-200 ${timeRange === 'year' ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>Год</button>
-              <button onClick={() => handleFilterClick(setTimeRange, 'all')} className={`px-3 py-1.5 rounded-full text-sm font-semibold transition-colors duration-200 ${timeRange === 'all' ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>Всё время</button>
+  const now = new Date();
+  const d30 = localDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30));
+  const d90 = localDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 90));
+  const d365 = localDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 365));
+
+  const isMonth = dateFrom === d30 && dateTo === TODAY;
+  const isQuarter = dateFrom === d90 && dateTo === TODAY;
+  const isYear = dateFrom === d365 && dateTo === TODAY;
+  const isAll = dateFrom === '' && dateTo === '';
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="text-slate-400 text-sm animate-pulse">Загрузка...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="text-rose-500 text-sm text-center px-6">{error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <main className="min-h-screen bg-slate-50 pb-6 font-sans">
+      <div className="w-full max-w-2xl mx-auto">
+        <div className="px-4 pt-6 pb-4">
+          <p className="text-xs font-medium text-slate-400 uppercase tracking-widest mb-1">Личный трекер</p>
+          <h1 className="text-2xl font-bold text-slate-800 tracking-tight">Финансы</h1>
+        </div>
+
+        <div className="px-4 mb-4 space-y-3">
+          <div className="flex gap-3 flex-wrap items-end">
+            <DateInput label="С" value={dateFrom} onChange={(v) => { setDateFrom(v); resetPage(); }} />
+            <DateInput label="По" value={dateTo} onChange={(v) => { setDateTo(v); resetPage(); }} />
+            <div className="flex gap-1.5 flex-wrap">
+              <PillButton active={isMonth} onClick={() => { setDateFrom(d30); setDateTo(TODAY); resetPage(); }}>30 дн.</PillButton>
+              <PillButton active={isQuarter} onClick={() => { setDateFrom(d90); setDateTo(TODAY); resetPage(); }}>90 дн.</PillButton>
+              <PillButton active={isYear} onClick={() => { setDateFrom(d365); setDateTo(TODAY); resetPage(); }}>365 дн.</PillButton>
+              <PillButton active={isAll} onClick={() => { setDateFrom(''); setDateTo(''); resetPage(); }}>Всё</PillButton>
             </div>
           </div>
-          {availableCurrencies.length > 1 && (
-            <div>
-              <h3 className="text-sm font-semibold text-slate-500 mb-2 px-2">Валюта</h3>
-              <div className="flex justify-center gap-2 flex-wrap">
-                <button onClick={() => handleFilterClick(setSelectedCurrency, 'all')} className={`px-4 py-1.5 rounded-full text-sm font-bold transition-colors duration-200 ${selectedCurrency === 'all' ? 'bg-slate-800 text-white shadow-sm' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}>Все</button>
-                {availableCurrencies.map(currency => (
-                  <button
-                    key={currency}
-                    onClick={() => handleFilterClick(setSelectedCurrency, currency)}
-                    className={`px-4 py-1.5 rounded-full text-sm font-bold transition-colors duration-200 ${selectedCurrency === currency ? 'bg-slate-800 text-white shadow-sm' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
-                  >
-                    {currency}
-                  </button>
-                ))}
-              </div>
+
+          {availableCurrencies.length > 0 && (
+            <div className="flex gap-1.5 flex-wrap items-center">
+              {availableCurrencies.map((c) => (
+                <PillButton
+                  key={c}
+                  active={reportCurrency === c}
+                  onClick={() => {
+                    setReportCurrency(c);
+                    setSelectedDisplayCurrency(null);
+                    resetPage();
+                  }}
+                >
+                  {c}
+                </PillButton>
+              ))}
+              {availableCurrencies.length > 1 && (
+                <select
+                  value={reportCurrency === 'all' ? (selectedDisplayCurrency ?? '') : ''}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v) {
+                      setReportCurrency('all');
+                      setSelectedDisplayCurrency(v);
+                      resetPage();
+                    }
+                  }}
+                  className={`text-xs border rounded-full px-3 py-1.5 font-medium transition-all duration-150 cursor-pointer ${
+                    reportCurrency === 'all' && selectedDisplayCurrency
+                      ? 'bg-slate-800 text-white border-slate-800'
+                      : 'bg-slate-100 text-slate-500 border-transparent hover:bg-slate-200'
+                  }`}
+                >
+                  <option value="">Все→</option>
+                  {availableCurrencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              )}
             </div>
           )}
         </div>
 
-        {selectedCurrency !== 'all' ? (
-          <>
-            {/* Summary Statistics */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
-              <div className="bg-white shadow-sm rounded-xl p-5"><div className="text-md text-slate-500">Доходы</div><div className="text-2xl font-bold text-green-600 mt-1">{totalIncome.toFixed(2)} {selectedCurrency}</div></div>
-              <div className="bg-white shadow-sm rounded-xl p-5"><div className="text-md text-slate-500">Расходы</div><div className="text-2xl font-bold text-slate-700 mt-1">{totalExpenses.toFixed(2)} {selectedCurrency}</div></div>
-              <div className="bg-white shadow-sm rounded-xl p-5"><div className="text-md text-slate-500">Итог</div><div className={`text-2xl font-bold mt-1 ${balance > 0 ? 'text-green-600' : balance < 0 ? 'text-slate-700' : 'text-slate-800'}`}>{(typeof balance === 'number' && !isNaN(balance)) ? balance.toFixed(2) : '0.00'} {selectedCurrency}</div></div>
-            </div>
-
-            {/* Charts Section */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="bg-white shadow-sm rounded-xl p-4"><h2 className="text-lg font-semibold mb-4 text-center text-slate-800">Расходы по категориям</h2><ExpensePieChart data={expenseCategoriesData} currency={selectedCurrency || ''} totalExpenses={totalExpenses} /></div>
-              <div className="bg-white shadow-sm rounded-xl p-4"><h2 className="text-lg font-semibold mb-4 text-center text-slate-800">Динамика по месяцам</h2><MonthlyBarChart data={monthlySummaryData} currency={selectedCurrency || ''} /></div>
-            </div>
-          </>
-        ) : (
-          <div className="bg-white shadow-sm rounded-xl p-6 text-center text-slate-600">
-            <p>Выберите валюту для просмотра статистики и диаграмм.</p>
-          </div>
-        )}
-
-        {/* Transaction List */}
-        <div className="bg-white shadow-sm rounded-xl p-4">
-          <div className="flex flex-col sm:flex-row justify-between items-center mb-3 px-2 gap-4">
-            <h2 className="text-lg font-semibold text-slate-800">Транзакции</h2>
-            <div className="flex items-center gap-4 flex-wrap justify-end">
-              <div className="flex items-center gap-2">
-                <FilterButton filterValue="all" label="Все" />
-                <FilterButton filterValue="income" label="Доходы" />
-                <FilterButton filterValue="expense" label="Расходы" />
-              </div>
-              <select onChange={(e) => { const [key, direction] = e.target.value.split('-'); handleFilterClick(setSortConfig, { key, direction }); }} value={`${sortConfig.key}-${sortConfig.direction}`} className="text-sm bg-gray-100 border-gray-300 rounded-md p-1.5 text-gray-800">
-                <option value="timestamp-desc">Сначала новые</option>
-                <option value="timestamp-asc">Сначала старые</option>
-                <option value="amount-desc">Сумма (убыв.)</option>
-                <option value="amount-asc">Сумма (возр.)</option>
-              </select>
-            </div>
-          </div>
-          <div className="space-y-2">
-            {paginatedTransactions.length === 0 ? (
-              <p className="text-center text-slate-500 py-8">Транзакций не найдено.</p>
-            ) : (
-              paginatedTransactions.map((tx, index) => (
-                <div key={tx.id} className={`flex items-center p-3 ${index < paginatedTransactions.length - 1 ? 'border-b border-slate-100' : ''}`}>
-                  <div className="mr-4">{tx.kind === 'income' ? <IncomeIcon /> : <ExpenseIcon />}</div>
-                  <div className="flex-grow"><div className="font-medium text-slate-800">{tx.title}</div><div className="text-sm text-slate-500">{tx.category} &middot; {new Date(tx.timestamp).toLocaleDateString()}</div></div>
-                  <div className={`text-right font-semibold ${tx.kind === 'income' ? 'text-green-600' : 'text-slate-700'}`}>{tx.kind === 'expense' ? '-' : '+'}{parseFloat(tx.amount as any).toFixed(2)} {tx.currency}</div>
+        <div className="px-4 space-y-4">
+          {statsTx.length > 0 ? (
+            <>
+              <div className="bg-slate-900 rounded-3xl p-5 text-white">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="text-center">
+                    <div className="text-[10px] font-medium text-slate-400 uppercase tracking-wider mb-1.5">Доходы</div>
+                    <div className="text-xl font-bold text-teal-400">{totalIncome.toFixed(0)}</div>
+                    <div className="text-[10px] text-slate-500 mt-0.5">{dashboardCurrency}</div>
+                  </div>
+                  <div className="text-center border-x border-slate-700">
+                    <div className="text-[10px] font-medium text-slate-400 uppercase tracking-wider mb-1.5">Расходы</div>
+                    <div className="text-xl font-bold text-rose-400">{totalExpenses.toFixed(0)}</div>
+                    <div className="text-[10px] text-slate-500 mt-0.5">{dashboardCurrency}</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-[10px] font-medium text-slate-400 uppercase tracking-wider mb-1.5">Итог</div>
+                    <div className={`text-xl font-bold ${balance >= 0 ? 'text-teal-400' : 'text-rose-400'}`}>
+                      {balance >= 0 ? '+' : ''}{balance.toFixed(0)}
+                    </div>
+                    <div className="text-[10px] text-slate-500 mt-0.5">{dashboardCurrency}</div>
+                  </div>
                 </div>
-              ))
+              </div>
+
+              {exchanges.length > 0 && reportCurrency !== 'all' && (
+                <div className="bg-amber-50 rounded-2xl p-4 flex justify-between items-center">
+                  <div>
+                    <div className="text-xs font-semibold text-amber-700">Потери на обменах</div>
+                    <div className="text-xs text-amber-500 mt-0.5">{exchanges.length} операций</div>
+                  </div>
+                  <div className="text-base font-bold text-amber-600">−{fxLoss.toFixed(2)}</div>
+                </div>
+              )}
+
+              <div className="bg-white rounded-2xl p-4">
+                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Расходы по категориям</div>
+                <ExpensePieChart
+                  data={expenseCategoriesData}
+                  currency={dashboardCurrency}
+                  totalExpenses={totalExpenses}
+                  transactions={statsTx}
+                />
+              </div>
+
+              <div className="bg-white rounded-2xl p-4">
+                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Динамика</div>
+                <MonthlyBarChart transactions={statsTx} currency={dashboardCurrency} />
+              </div>
+            </>
+          ) : (
+            <div className="bg-white rounded-2xl p-4 text-center text-slate-400 text-sm">
+              {reportCurrency === 'all' ? 'Выбери валюту в списке выше →' : 'Нет данных'}
+            </div>
+          )}
+        </div>
+
+        <div className="px-4 space-y-3 mt-4">
+          <div className="flex gap-1.5 flex-wrap items-center justify-between">
+            <div className="flex gap-1.5">
+              {(['all', 'income', 'expense', 'transfer'] as const).map((k) => (
+                <PillButton
+                  key={k}
+                  active={typeFilter === k}
+                  onClick={() => {
+                    setTypeFilter(k);
+                    resetPage();
+                  }}
+                >
+                  {k === 'all' ? 'Все' : kindConfig[k].label}
+                </PillButton>
+              ))}
+            </div>
+            <select
+              value={sortKey}
+              onChange={(e) => {
+                setSortKey(e.target.value as SortKey);
+                resetPage();
+              }}
+              className="text-xs bg-white border border-slate-200 rounded-xl px-2 py-1.5 text-slate-500 cursor-pointer"
+            >
+              <option value="timestamp-desc">Новые</option>
+              <option value="timestamp-asc">Старые</option>
+              <option value="amount-desc">Сумма ↓</option>
+              <option value="amount-asc">Сумма ↑</option>
+            </select>
+          </div>
+
+          <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+            {paginatedTx.length === 0 ? (
+              <p className="text-center text-slate-400 py-10 text-sm">Нет операций</p>
+            ) : (
+              paginatedTx.map((tx, i) => {
+                const cfg = kindConfig[tx.kind];
+                return (
+                  <div key={tx.id} className={`flex items-center px-4 py-3 ${i < paginatedTx.length - 1 ? 'border-b border-slate-50' : ''}`}>
+                    <div className={`w-8 h-8 rounded-full ${cfg.bg} flex items-center justify-center text-sm font-bold ${cfg.color} mr-3 shrink-0`}>
+                      {cfg.sign}
+                    </div>
+                    <div className="flex-grow min-w-0">
+                      <div className="text-sm font-medium text-slate-800 truncate">{tx.title}</div>
+                      <div className="text-xs text-slate-400">{tx.category} · {new Date(tx.timestamp).toLocaleDateString('ru-RU')}</div>
+                    </div>
+                    <div className={`text-sm font-semibold ml-2 shrink-0 ${cfg.color}`}>
+                      {cfg.sign}{toNumber(tx.amount).toFixed(2)} {tx.currency}
+                    </div>
+                  </div>
+                );
+              })
             )}
           </div>
+
           {totalPages > 1 && (
-            <div className="flex justify-between items-center mt-4 pt-3 border-t border-slate-200">
-              <button onClick={() => { handleFilterClick(setCurrentPage, (p: number) => Math.max(1, p - 1)); }} disabled={currentPage === 1} className="px-3 py-1 bg-gray-200 text-gray-700 rounded-md disabled:opacity-50">Назад</button>
-              <span className="text-sm text-slate-600">Стр. {currentPage} из {totalPages}</span>
-              <button onClick={() => { handleFilterClick(setCurrentPage, (p: number) => Math.min(totalPages, p + 1)); }} disabled={currentPage === totalPages} className="px-3 py-1 bg-gray-200 text-gray-700 rounded-md disabled:opacity-50">Вперед</button>
+            <div className="flex justify-between items-center">
+              <button
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={safePage === 1}
+                className="px-4 py-1.5 bg-white rounded-xl text-sm text-slate-600 disabled:opacity-40 shadow-sm"
+              >
+                ← Назад
+              </button>
+              <span className="text-xs text-slate-400">{safePage} / {totalPages}</span>
+              <button
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                disabled={safePage === totalPages}
+                className="px-4 py-1.5 bg-white rounded-xl text-sm text-slate-600 disabled:opacity-40 shadow-sm"
+              >
+                Вперёд →
+              </button>
             </div>
+          )}
+        </div>
+
+        <div className="px-4 space-y-3 mt-4">
+          {exchanges.length === 0 ? (
+            <div className="bg-white rounded-2xl p-6 text-center text-slate-400 text-sm">
+              Нет записей об обменах.<br />Скажи боту: «поменяла 500 USD на 16500 THB»
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-white rounded-2xl p-4 shadow-sm text-center">
+                  <div className="text-xs text-slate-400 mb-1">Обменов всего</div>
+                  <div className="text-xl font-bold text-slate-700">{exchanges.length}</div>
+                </div>
+                <div className="bg-amber-50 rounded-2xl p-4 shadow-sm text-center">
+                  <div className="text-xs text-amber-500 mb-1">Потеряно на курсе</div>
+                  <div className="text-xl font-bold text-amber-600">−{fxLoss.toFixed(2)}</div>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+                {exchanges.map((ex, i) => {
+                  const diff = ex.rate_diff_pct != null ? toNumber(ex.rate_diff_pct) : null;
+                  return (
+                    <div key={ex.id} className={`px-4 py-3 ${i < exchanges.length - 1 ? 'border-b border-slate-50' : ''}`}>
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-800">
+                            {toNumber(ex.from_amount).toFixed(2)} {ex.from_currency} → {toNumber(ex.to_amount).toFixed(2)} {ex.to_currency}
+                          </div>
+                          <div className="text-xs text-slate-400 mt-0.5">
+                            Курс: {toNumber(ex.actual_rate).toFixed(4)}
+                            {ex.market_rate != null && <> · Рынок: {toNumber(ex.market_rate).toFixed(4)}</>}
+                            {ex.note && <> · {ex.note}</>}
+                          </div>
+                        </div>
+                        <div className="text-right ml-3 shrink-0">
+                          {diff != null && (
+                            <div className={`text-xs font-semibold ${diff < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                              {diff > 0 ? '+' : ''}{diff.toFixed(2)}%
+                            </div>
+                          )}
+                          <div className="text-xs text-slate-400">{new Date(ex.exchanged_at).toLocaleDateString('ru-RU')}</div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </div>
       </div>

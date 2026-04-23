@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "dev": "BROWSERSLIST_IGNORE_OLD_DATA=1 next dev",
+    "build": "/bin/bash -lc 'BASELINE_BROWSER_MAPPING_IGNORE_OLD_DATA=1 BROWSERSLIST_IGNORE_OLD_DATA=1 next build 2>&1 | grep -v \"\\[baseline-browser-mapping\\]\"; exit ${PIPESTATUS[0]}'",
+    "start": "BROWSERSLIST_IGNORE_OLD_DATA=1 next start",
+    "lint": "BROWSERSLIST_IGNORE_OLD_DATA=1 eslint"
   },
   "dependencies": {
     "@types/crypto-js": "^4.2.2",
@@ -24,6 +24,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "babel-plugin-react-compiler": "1.0.0",
+    "baseline-browser-mapping": "^2.10.21",
     "eslint": "^9",
     "eslint-config-next": "16.0.3",
     "tailwindcss": "^4",
