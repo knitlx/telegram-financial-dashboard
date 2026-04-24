@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Optional
 from openai import AsyncOpenAI
 from tools.transactions import add_transaction, get_transactions, update_transaction, delete_transaction
@@ -10,6 +11,16 @@ from tools.transfers import record_exchange, get_exchange_stats, get_exchanges
 from tools.balances import set_balance_snapshot, get_balance_snapshots, get_currency_balances
 
 _client: Optional[AsyncOpenAI] = None
+
+
+_DB_ACTION_HINT_RE = re.compile(
+    r"(запиш|добав|внес|потрат|доход|купил|купила|перев[её]л|обмен|удал|измени|исправ|сверк|баланс)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_db_action(text: str) -> bool:
+    return bool(_DB_ACTION_HINT_RE.search(text))
 
 
 def _get_client() -> AsyncOpenAI:
@@ -372,8 +383,10 @@ async def run_agent(
     messages.append({"role": "user", "content": text})
 
     log = os.environ.get("TEST_LOG") == "1"
+    action_request = _looks_like_db_action(text)
+    had_tool_call = False
 
-    for _ in range(5):
+    for _ in range(6):
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -384,8 +397,20 @@ async def run_agent(
         messages.append(msg.model_dump(exclude_unset=True))
 
         if not msg.tool_calls:
+            if action_request and not had_tool_call:
+                # Hard safety: never "confirm write" when no DB tool was called.
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Похоже пользователь просит действие в БД, но ты не вызвал ни одного инструмента. "
+                        "Сделай корректный tool call. Если данных не хватает — задай уточняющий вопрос и "
+                        "не утверждай, что запись выполнена."
+                    ),
+                })
+                continue
             return msg.content or ""
 
+        had_tool_call = True
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments)
             if log:
@@ -404,4 +429,6 @@ async def run_agent(
                 "content": result,
             })
 
+    if action_request and not had_tool_call:
+        return "Не удалось безопасно записать операцию. Повтори формулировку с суммой и валютой."
     return messages[-1].get("content", "Не удалось обработать запрос.")
