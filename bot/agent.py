@@ -42,6 +42,18 @@ def _looks_like_db_action(text: str) -> bool:
     return False
 
 
+def _is_meta_question(text: str) -> bool:
+    lowered = text.strip().lower()
+    has_amount = bool(re.search(r"\d+[.,]?\d*", lowered))
+    if "?" in lowered and not has_amount:
+        return True
+    if re.search(r"^(как|почему|зачем|что|можешь|можно|объясни)\b", lowered):
+        return True
+    if "промт" in lowered or "prompt" in lowered:
+        return True
+    return False
+
+
 def _tool_result_ok(result: str) -> bool:
     try:
         parsed = json.loads(result)
@@ -416,7 +428,7 @@ async def run_agent(
     messages.append({"role": "user", "content": text})
 
     log = os.environ.get("TEST_LOG") == "1"
-    action_request = _looks_like_db_action(text)
+    action_request = _looks_like_db_action(text) and not _is_meta_question(text)
     had_tool_call = False
     had_financial_write_tool_call = False
     financial_write_succeeded = False
