@@ -35,7 +35,13 @@ class SubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         channel_url = os.environ.get("REQUIRED_CHANNEL_URL", "https://t.me/nochaos_with_ai")
-        bot_check_url = os.environ.get("BOT_CHECK_URL", "https://t.me/Knitlx_helper_bot?start=check")
+        bot_check_url = os.environ.get("BOT_CHECK_URL")
+        if not bot_check_url:
+            me = await bot.get_me()
+            if me.username:
+                bot_check_url = f"https://t.me/{me.username}?start=check"
+            else:
+                bot_check_url = "https://t.me"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Подписаться", url=channel_url)],
             [InlineKeyboardButton(text="✅ Я подписался — проверить", url=bot_check_url)],
