@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from typing import Optional
 from openai import AsyncOpenAI
 from tools.transactions import add_transaction, get_transactions, update_transaction, delete_transaction
@@ -13,13 +12,18 @@ from tools.balances import set_balance_snapshot, get_balance_snapshots, get_curr
 _client: Optional[AsyncOpenAI] = None
 
 
-_DB_ACTION_HINT_RE = re.compile(
-    r"(запиш|добав|внес|потрат|доход|купил|купила|перев[её]л|обмен|удал|измени|исправ|сверк|баланс)",
-    re.IGNORECASE,
-)
-_WRITE_CONFIRM_RE = re.compile(
-    r"(запис(ал|ала|ано|ан)|добав(ил|ила|лено|лен)|внес(ла)?|сохрани(л|ла|ено|ен)|удали(л|ла|ено|ен)|измени(л|ла|ено|ен)|готово)",
-    re.IGNORECASE,
+_WRITE_CONFIRM_MARKERS = (
+    "записал",
+    "записала",
+    "записано",
+    "добавил",
+    "добавила",
+    "добавлено",
+    "внес",
+    "внесла",
+    "сохранил",
+    "сохранила",
+    "готово",
 )
 _FINANCIAL_WRITE_TOOL_NAMES = {
     "add_transaction",
@@ -30,28 +34,46 @@ _FINANCIAL_WRITE_TOOL_NAMES = {
 }
 
 
-def _looks_like_db_action(text: str) -> bool:
-    if _DB_ACTION_HINT_RE.search(text):
-        return True
-    # Common "quick expense" format: amount + currency/symbol without verbs.
-    if re.search(r"\d+[.,]?\d*\s*(₽|р\\b|руб|rub|฿|бат|thb|\\$|usd|usdt|eur|€|inr|₹)", text, re.IGNORECASE):
-        return True
-    # Also treat "250 платье" as write intent (currency can be implicit via default settings).
-    if re.search(r"^\s*\d+[.,]?\d*\s+\S+", text):
-        return True
-    return False
+async def _detect_write_intent(client: AsyncOpenAI, model: str, text: str, history: list[dict]) -> bool:
+    context_lines: list[str] = []
+    for msg in history[-6:]:
+        role = msg.get("role")
+        content = (msg.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            context_lines.append(f"{role}: {content[:300]}")
+    context_block = "\n".join(context_lines)
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Классифицируй текущее сообщение пользователя.\n"
+                        "Ответ ТОЛЬКО одним словом:\n"
+                        "WRITE — если пользователь просит изменить данные в БД "
+                        "(добавить/исправить/удалить транзакцию, обмен, сверку баланса, настройки, категории).\n"
+                        "CHAT — если это вопрос, обсуждение, объяснение, мета-разговор о промте/логике и т.п."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Контекст:\n{context_block}\n\nТекущее сообщение:\n{text}",
+                },
+            ],
+            temperature=0,
+            max_tokens=3,
+        )
+        verdict = (response.choices[0].message.content or "").strip().upper()
+        return verdict.startswith("WRITE")
+    except Exception:
+        return False
 
 
-def _is_meta_question(text: str) -> bool:
-    lowered = text.strip().lower()
-    has_amount = bool(re.search(r"\d+[.,]?\d*", lowered))
-    if "?" in lowered and not has_amount:
-        return True
-    if re.search(r"^(как|почему|зачем|что|можешь|можно|объясни)\b", lowered):
-        return True
-    if "промт" in lowered or "prompt" in lowered:
-        return True
-    return False
+def _looks_like_write_confirmation(content: str) -> bool:
+    lowered = content.lower()
+    return any(marker in lowered for marker in _WRITE_CONFIRM_MARKERS)
 
 
 def _tool_result_ok(result: str) -> bool:
@@ -428,7 +450,7 @@ async def run_agent(
     messages.append({"role": "user", "content": text})
 
     log = os.environ.get("TEST_LOG") == "1"
-    action_request = _looks_like_db_action(text) and not _is_meta_question(text)
+    action_request = await _detect_write_intent(client, model, text, history)
     had_tool_call = False
     had_financial_write_tool_call = False
     financial_write_succeeded = False
@@ -467,7 +489,7 @@ async def run_agent(
                 continue
             if action_request and had_financial_write_tool_call and not financial_write_succeeded:
                 return "Не удалось записать операцию в базу. Повтори запрос, пожалуйста."
-            if not had_tool_call and _WRITE_CONFIRM_RE.search(content):
+            if not had_tool_call and _looks_like_write_confirmation(content):
                 messages.append({
                     "role": "system",
                     "content": (
@@ -476,7 +498,7 @@ async def run_agent(
                     ),
                 })
                 continue
-            if _WRITE_CONFIRM_RE.search(content) and not financial_write_succeeded:
+            if _looks_like_write_confirmation(content) and not financial_write_succeeded:
                 messages.append({
                     "role": "system",
                     "content": (
