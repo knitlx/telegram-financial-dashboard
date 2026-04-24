@@ -18,7 +18,7 @@ _DB_ACTION_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _WRITE_CONFIRM_RE = re.compile(
-    r"(записал|записала|добавил|добавила|внес|внесла|сохранил|сохранила|удалил|измени[лла])",
+    r"(запис(ал|ала|ано|ан)|добав(ил|ила|лено|лен)|внес(ла)?|сохрани(л|ла|ено|ен)|удали(л|ла|ено|ен)|измени(л|ла|ено|ен)|готово)",
     re.IGNORECASE,
 )
 _FINANCIAL_WRITE_TOOL_NAMES = {
@@ -35,6 +35,9 @@ def _looks_like_db_action(text: str) -> bool:
         return True
     # Common "quick expense" format: amount + currency/symbol without verbs.
     if re.search(r"\d+[.,]?\d*\s*(₽|р\\b|руб|rub|฿|бат|thb|\\$|usd|usdt|eur|€|inr|₹)", text, re.IGNORECASE):
+        return True
+    # Also treat "250 платье" as write intent (currency can be implicit via default settings).
+    if re.search(r"^\s*\d+[.,]?\d*\s+\S+", text):
         return True
     return False
 
