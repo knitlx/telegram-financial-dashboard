@@ -21,16 +21,12 @@ _WRITE_CONFIRM_RE = re.compile(
     r"(записал|записала|добавил|добавила|внес|внесла|сохранил|сохранила|удалил|измени[лла])",
     re.IGNORECASE,
 )
-_WRITE_TOOL_NAMES = {
+_FINANCIAL_WRITE_TOOL_NAMES = {
     "add_transaction",
     "update_transaction",
     "delete_transaction",
     "record_exchange",
     "set_balance_snapshot",
-    "set_user_settings",
-    "add_category",
-    "rename_category",
-    "deactivate_category",
 }
 
 
@@ -419,8 +415,8 @@ async def run_agent(
     log = os.environ.get("TEST_LOG") == "1"
     action_request = _looks_like_db_action(text)
     had_tool_call = False
-    had_write_tool_call = False
-    write_tool_succeeded = False
+    had_financial_write_tool_call = False
+    financial_write_succeeded = False
 
     for _ in range(6):
         response = await client.chat.completions.create(
@@ -445,7 +441,7 @@ async def run_agent(
                     ),
                 })
                 continue
-            if action_request and not had_write_tool_call:
+            if action_request and not had_financial_write_tool_call:
                 messages.append({
                     "role": "system",
                     "content": (
@@ -454,7 +450,7 @@ async def run_agent(
                     ),
                 })
                 continue
-            if action_request and had_write_tool_call and not write_tool_succeeded:
+            if action_request and had_financial_write_tool_call and not financial_write_succeeded:
                 return "Не удалось записать операцию в базу. Повтори запрос, пожалуйста."
             if not had_tool_call and _WRITE_CONFIRM_RE.search(content):
                 messages.append({
@@ -462,6 +458,15 @@ async def run_agent(
                     "content": (
                         "Ты подтвердил запись/изменение, но tool не вызывался. "
                         "Это запрещено. Либо вызови нужный tool, либо честно скажи, что не записал."
+                    ),
+                })
+                continue
+            if _WRITE_CONFIRM_RE.search(content) and not financial_write_succeeded:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Нельзя подтверждать запись финансовой операции без успешного финансового mutating tool "
+                        "(add/update/delete transaction, record_exchange, set_balance_snapshot)."
                     ),
                 })
                 continue
@@ -473,10 +478,10 @@ async def run_agent(
             if log:
                 print(f"  \U0001f527 {tc.function.name}({json.dumps(args, ensure_ascii=False)})")
             result = await _dispatch_tool(tc.function.name, args, user_id)
-            if tc.function.name in _WRITE_TOOL_NAMES:
-                had_write_tool_call = True
+            if tc.function.name in _FINANCIAL_WRITE_TOOL_NAMES:
+                had_financial_write_tool_call = True
                 if _tool_result_ok(result):
-                    write_tool_succeeded = True
+                    financial_write_succeeded = True
             if log:
                 try:
                     parsed = json.loads(result)
@@ -490,6 +495,6 @@ async def run_agent(
                 "content": result,
             })
 
-    if action_request and (not had_write_tool_call or not write_tool_succeeded):
+    if action_request and (not had_financial_write_tool_call or not financial_write_succeeded):
         return "Не удалось безопасно записать операцию. Повтори формулировку с суммой и валютой."
     return messages[-1].get("content", "Не удалось обработать запрос.")
