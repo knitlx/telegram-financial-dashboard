@@ -17,10 +17,19 @@ _DB_ACTION_HINT_RE = re.compile(
     r"(запиш|добав|внес|потрат|доход|купил|купила|перев[её]л|обмен|удал|измени|исправ|сверк|баланс)",
     re.IGNORECASE,
 )
+_WRITE_CONFIRM_RE = re.compile(
+    r"(записал|записала|добавил|добавила|внес|внесла|сохранил|сохранила|удалил|измени[лла])",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_db_action(text: str) -> bool:
-    return bool(_DB_ACTION_HINT_RE.search(text))
+    if _DB_ACTION_HINT_RE.search(text):
+        return True
+    # Common "quick expense" format: amount + currency/symbol without verbs.
+    if re.search(r"\d+[.,]?\d*\s*(₽|р\\b|руб|rub|฿|бат|thb|\\$|usd|usdt|eur|€|inr|₹)", text, re.IGNORECASE):
+        return True
+    return False
 
 
 def _get_client() -> AsyncOpenAI:
@@ -397,6 +406,7 @@ async def run_agent(
         messages.append(msg.model_dump(exclude_unset=True))
 
         if not msg.tool_calls:
+            content = msg.content or ""
             if action_request and not had_tool_call:
                 # Hard safety: never "confirm write" when no DB tool was called.
                 messages.append({
@@ -408,7 +418,16 @@ async def run_agent(
                     ),
                 })
                 continue
-            return msg.content or ""
+            if not had_tool_call and _WRITE_CONFIRM_RE.search(content):
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Ты подтвердил запись/изменение, но tool не вызывался. "
+                        "Это запрещено. Либо вызови нужный tool, либо честно скажи, что не записал."
+                    ),
+                })
+                continue
+            return content
 
         had_tool_call = True
         for tc in msg.tool_calls:
