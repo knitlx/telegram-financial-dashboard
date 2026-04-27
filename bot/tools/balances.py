@@ -1,28 +1,13 @@
 import json
 from typing import Optional
-from db import fetch, execute
+from db import fetch
 
 
-async def _ensure_balance_snapshots_table() -> None:
-    await execute(
-        """
-        CREATE TABLE IF NOT EXISTS public.balance_snapshots (
-            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            user_id bigint NOT NULL,
-            currency text NOT NULL,
-            balance_amount numeric(18,4) NOT NULL,
-            note text,
-            snapshot_at timestamp with time zone NOT NULL DEFAULT now(),
-            created_at timestamp with time zone NOT NULL DEFAULT now()
-        )
-        """
-    )
-    await execute(
-        """
-        CREATE INDEX IF NOT EXISTS balance_snapshots_user_currency_idx
-            ON public.balance_snapshots (user_id, currency, snapshot_at DESC)
-        """
-    )
+async def _require_balance_snapshots_table() -> None:
+    rows = await fetch("SELECT to_regclass('public.balance_snapshots')::text AS table_name")
+    table_name = rows[0].get("table_name") if rows else None
+    if not table_name:
+        raise RuntimeError("balance_snapshots table is missing. Run DB migrations first.")
 
 
 async def set_balance_snapshot(
@@ -32,7 +17,7 @@ async def set_balance_snapshot(
     iso_datetime: Optional[str] = None,
     note: Optional[str] = None,
 ) -> str:
-    await _ensure_balance_snapshots_table()
+    await _require_balance_snapshots_table()
     rows = await fetch(
         """
         INSERT INTO public.balance_snapshots (user_id, currency, balance_amount, snapshot_at, note)
@@ -51,7 +36,7 @@ async def set_balance_snapshot(
 
 
 async def get_balance_snapshots(user_id: int, currency: str = "", limit: int = 20) -> str:
-    await _ensure_balance_snapshots_table()
+    await _require_balance_snapshots_table()
     rows = await fetch(
         """
         SELECT id, currency, balance_amount,
@@ -72,7 +57,7 @@ async def get_balance_snapshots(user_id: int, currency: str = "", limit: int = 2
 
 
 async def get_currency_balances(user_id: int) -> str:
-    await _ensure_balance_snapshots_table()
+    await _require_balance_snapshots_table()
     rows = await fetch(
         """
         WITH currencies AS (
